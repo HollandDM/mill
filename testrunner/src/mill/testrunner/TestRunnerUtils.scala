@@ -132,45 +132,40 @@ import java.nio.file.AtomicMoveNotSupportedException
     (runner, tasks)
   }
 
-  def runTasks(tasks: Seq[Task], testReporter: TestReporter, runner: Runner)(implicit
-      ctx: Ctx.Log
-  ): (String, Iterator[TestResult]) = {
-    val events = new ConcurrentLinkedQueue[Event]()
-    val doneMessage = {
+  private def executeTasks(
+    tasks: Seq[Task],
+    testReporter: TestReporter,
+    runner: Runner,
+    events: ConcurrentLinkedQueue[Event]
+  )(implicit ctx: Ctx.Log): Unit = {
+    val taskQueue = tasks.to(mutable.Queue)
+    while (taskQueue.nonEmpty) {
+      val next = taskQueue.dequeue().execute(
+        new EventHandler {
+          def handle(event: Event) = {
+            testReporter.logStart(event)
+            events.add(event)
+            testReporter.logFinish(event)
+          }
+        },
+        Array(new Logger {
+          def debug(msg: String) = ctx.log.outputStream.println(msg)
+          def error(msg: String) = ctx.log.outputStream.println(msg)
+          def ansiCodesSupported() = true
+          def warn(msg: String) = ctx.log.outputStream.println(msg)
+          def trace(t: Throwable) = t.printStackTrace(ctx.log.outputStream)
+          def info(msg: String) = ctx.log.outputStream.println(msg)
+        })
+      )
 
-      val taskQueue = tasks.to(mutable.Queue)
-      while (taskQueue.nonEmpty) {
-        val next = taskQueue.dequeue().execute(
-          new EventHandler {
-            def handle(event: Event) = {
-              testReporter.logStart(event)
-              events.add(event)
-              testReporter.logFinish(event)
-            }
-          },
-          Array(new Logger {
-            def debug(msg: String) = ctx.log.outputStream.println(msg)
-            def error(msg: String) = ctx.log.outputStream.println(msg)
-            def ansiCodesSupported() = true
-            def warn(msg: String) = ctx.log.outputStream.println(msg)
-            def trace(t: Throwable) = t.printStackTrace(ctx.log.outputStream)
-            def info(msg: String) = ctx.log.outputStream.println(msg)
-          })
-        )
-
-        taskQueue.enqueueAll(next)
-      }
-      runner.done()
+      taskQueue.enqueueAll(next)
     }
+  }
 
-    if (doneMessage != null && doneMessage.nonEmpty) {
-      if (doneMessage.endsWith("\n"))
-        ctx.log.outputStream.print(doneMessage)
-      else
-        ctx.log.outputStream.println(doneMessage)
-    }
-
-    val results = for (e <- events.iterator().asScala) yield {
+  private def parseRunTaskResults(
+    events: Iterator[Event]
+  ) = {
+    events.map { e =>
       val ex =
         if (e.throwable().isDefined) Some(e.throwable().get) else None
       mill.testrunner.TestResult(
@@ -189,6 +184,25 @@ import java.nio.file.AtomicMoveNotSupportedException
         ex.map(_.getStackTrace.toIndexedSeq)
       )
     }
+  }
+
+  def runTasks(tasks: Seq[Task], testReporter: TestReporter, runner: Runner)(implicit
+      ctx: Ctx.Log
+  ): (String, Iterator[TestResult]) = {
+    val events = new ConcurrentLinkedQueue[Event]()
+    val doneMessage = {
+      executeTasks(tasks, testReporter, runner, events)
+      runner.done()
+    }
+
+    if (doneMessage != null && doneMessage.nonEmpty) {
+      if (doneMessage.endsWith("\n"))
+        ctx.log.outputStream.print(doneMessage)
+      else
+        ctx.log.outputStream.println(doneMessage)
+    }
+
+    val results = parseRunTaskResults(events.iterator().asScala)
 
     (doneMessage, results)
   }
@@ -211,6 +225,50 @@ import java.nio.file.AtomicMoveNotSupportedException
     (doneMessage, results.toSeq)
   }
 
+  private def stealTaskFromSelectorFolder(
+    testClasses: Seq[(Class[?], Fingerprint)],
+    runner: Runner,
+    stealFolder: os.Path,
+    selectorFolder: os.Path
+  )(implicit ctx: Ctx.Log): Array[Task] = {
+    while (true) {
+      val files = os.list(selectorFolder)
+      if (files.nonEmpty) {
+        val offset = Random.nextInt(files.size)
+        val stole = try {
+          os.move(
+            files(offset),
+            stealFolder / s"selector-stolen",
+            atomicMove = true
+          )
+          true
+        } catch {
+          case e: Exception => false
+        }
+        if (stole) {
+          val selectors = os.read.lines(stealFolder / s"selector-stolen")
+          val classFilter = TestRunnerUtils.globFilter(selectors)
+          val tasks = runner.tasks(
+            for ((cls, fingerprint) <- testClasses.iterator.toArray if classFilter(cls.getName))
+              yield new TaskDef(
+                cls.getName.stripSuffix("$"),
+                fingerprint,
+                false,
+                Array(new SuiteSelector)
+              )
+          )
+          os.remove(stealFolder / s"selector-stolen")
+          return tasks
+        }
+      } else {
+        return Array.empty[Task]
+      }
+    }
+
+    // Compiler doesn't know that we returned from above, add this as a sanity check and assertion
+    ???
+  }
+
   def stealTasks(
     testClasses: Seq[(Class[?], Fingerprint)],
     testReporter: TestReporter,
@@ -221,80 +279,16 @@ import java.nio.file.AtomicMoveNotSupportedException
     val events = new ConcurrentLinkedQueue[Event]()
     val doneMessage = {
 
-      val taskQueue = mutable.Queue.empty[Task]
-
-      @tailrec
-      def stealFromSelectorFolder(): Boolean = {
-        val files = os.list(selectorFolder)
-        if (files.nonEmpty) {
-          var shouldRetry = false
-          val offset = Random.nextInt(files.size)
-          try {
-            os.move(
-              files(offset),
-              stealFolder / s"selector-stolen",
-              atomicMove = true
-            )
-          } catch {
-            case e: Exception =>
-              // fail to steal, try again
-              shouldRetry = true
-          }
-          if (shouldRetry) {
-            stealFromSelectorFolder()
-          } else {
-            // we successfully stole a selector
-            val selectors = os.read.lines(stealFolder / s"selector-stolen")
-            val classFilter = TestRunnerUtils.globFilter(selectors)
-            val tasks = runner.tasks(
-              for ((cls, fingerprint) <- testClasses.iterator.toArray if classFilter(cls.getName))
-                yield new TaskDef(
-                  cls.getName.stripSuffix("$"),
-                  fingerprint,
-                  false,
-                  Array(new SuiteSelector)
-                )
-            )
-            taskQueue.enqueueAll(tasks)
-            os.remove(stealFolder / s"selector-stolen")
-            true
-          }
+      while ({
+        val tasks = stealTaskFromSelectorFolder(testClasses, runner, stealFolder, selectorFolder)
+        if (tasks.nonEmpty) {
+          executeTasks(tasks, testReporter, runner, events)
+          true
         } else {
           false
         }
-      }
+      })()
 
-      @tailrec
-      def stealTaskLoop(): Unit = {
-        if (taskQueue.nonEmpty) {
-          val next = taskQueue.dequeue().execute(
-            new EventHandler {
-              def handle(event: Event) = {
-                testReporter.logStart(event)
-                events.add(event)
-                testReporter.logFinish(event)
-              }
-            },
-            Array(new Logger {
-              def debug(msg: String) = ctx.log.outputStream.println(msg)
-              def error(msg: String) = ctx.log.outputStream.println(msg)
-              def ansiCodesSupported() = true
-              def warn(msg: String) = ctx.log.outputStream.println(msg)
-              def trace(t: Throwable) = t.printStackTrace(ctx.log.outputStream)
-              def info(msg: String) = ctx.log.outputStream.println(msg)
-            })
-          )
-
-          taskQueue.enqueueAll(next)
-          stealTaskLoop()
-        } else if (stealFromSelectorFolder()) {
-          stealTaskLoop()
-        } else {
-          ()
-        }
-      }
-
-      stealTaskLoop()
       runner.done()
     }
 
@@ -305,25 +299,7 @@ import java.nio.file.AtomicMoveNotSupportedException
         ctx.log.outputStream.println(doneMessage)
     }
 
-    val results = for (e <- events.iterator().asScala) yield {
-      val ex =
-        if (e.throwable().isDefined) Some(e.throwable().get) else None
-      mill.testrunner.TestResult(
-        e.fullyQualifiedName(),
-        e.selector() match {
-          case s: NestedSuiteSelector => s.suiteId()
-          case s: NestedTestSelector => s.suiteId() + "." + s.testName()
-          case s: SuiteSelector => s.toString
-          case s: TestSelector => s.testName()
-          case s: TestWildcardSelector => s.testWildcard()
-        },
-        e.duration(),
-        e.status().toString,
-        ex.map(_.getClass.getName),
-        ex.map(_.getMessage),
-        ex.map(_.getStackTrace.toIndexedSeq)
-      )
-    }
+    val results = parseRunTaskResults(events.iterator().asScala)
 
     (doneMessage, results)
   }

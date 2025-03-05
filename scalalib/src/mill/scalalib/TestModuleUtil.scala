@@ -47,12 +47,12 @@ private[scalalib] object TestModuleUtil {
       val selectorFolder = base / "selectors"
       os.makeDir.all(selectorFolder)
       selectors2.zipWithIndex.foreach { case (s, i) =>
-        os.write.over(selectorFolder / s"selector-$i", s)
+        os.write.over(selectorFolder / s, s)
       }
       selectorFolder
     }
 
-    def runTestRunnerSubprocess(index: Int, base: os.Path, selectorFolder: os.Path) = {
+    def runTestRunnerSubprocess(base: os.Path, selectorFolder: os.Path) = {
       if (os.list(selectorFolder).nonEmpty) {
         os.makeDir.all(base)
 
@@ -100,31 +100,6 @@ private[scalalib] object TestModuleUtil {
       } else {
         None
       }
-    }
-
-    def runTestRunnerSubprocesses(selectors2: Seq[String], base: os.Path) = {
-      val selectorFolder = prepareTestSelectorFolder(selectors2, base)
-
-      val resultFutures = Range(0, selectors2.length).map { index =>
-        val indexStr = index.toString
-        Task.fork.async(base / indexStr, indexStr, s"Test process $indexStr") {
-          (indexStr, runTestRunnerSubprocess(index, base / indexStr, selectorFolder))
-        }
-      }
-
-      val results = Task.fork.awaitAll(resultFutures)
-
-      val (lefts, rights) = results
-        .collect {
-          case (name, Some(result)) => name -> result
-        }
-        .partitionMap {
-          case (name, Result.Failure(v)) => Left(name + " " + v)
-          case (name, Result.Success((msg, results))) => Right((name + " " + msg, results))
-        }
-
-      if (lefts.nonEmpty) Result.Failure(lefts.mkString("\n"))
-      else Result.Success((rights.map(_._1).mkString("\n"), rights.flatMap(_._2)))
     }
 
     val globFilter = TestRunnerUtils.globFilter(selectors)
@@ -178,20 +153,18 @@ private[scalalib] object TestModuleUtil {
       }
     if (selectors.nonEmpty && filteredClassLists.isEmpty) throw doesNotMatchError
 
-    val subprocessResult: Result[(String, Seq[TestResult])] = filteredClassLists match {
-      // When no tests at all are discovered, run at least one test JVM
-      // process to go through the test framework setup/teardown logic
-      case Nil => runTestRunnerSubprocesses(Nil, Task.dest)
-      case Seq(singleTestClassList) => runTestRunnerSubprocesses(singleTestClassList, Task.dest)
+    val subprocessFolderData = filteredClassLists match {
+      case Nil => Seq((Task.dest, prepareTestSelectorFolder(Nil, Task.dest), "", 0))
+      case Seq(singleTestClassList) =>
+        val promptMessage = singleTestClassList match {
+          case Seq(single) => single
+          case multiple =>
+            collapseTestClassNames(multiple).mkString(", ") + s", ${multiple.length} suites"
+        }
+        Seq((Task.dest, prepareTestSelectorFolder(singleTestClassList, Task.dest), promptMessage, singleTestClassList.length))
       case multipleTestClassLists =>
         val maxLength = multipleTestClassLists.length.toString.length
-        val futures = multipleTestClassLists.zipWithIndex.map { case (testClassList, i) =>
-          val groupPromptMessage = testClassList match {
-            case Seq(single) => single
-            case multiple =>
-              collapseTestClassNames(multiple).mkString(", ") + s", ${multiple.length} suites"
-          }
-
+        multipleTestClassLists.zipWithIndex.map { case (testClassList, i) =>
           val paddedIndex = mill.internal.Util.leftPad(i.toString, maxLength, '0')
           val folderName = testClassList match {
             case Seq(single) => single
@@ -199,21 +172,53 @@ private[scalalib] object TestModuleUtil {
               s"group-$paddedIndex-${multiple.head}"
           }
 
-          Task.fork.async(Task.dest / folderName, paddedIndex, groupPromptMessage) {
-            (folderName, runTestRunnerSubprocesses(testClassList, Task.dest / folderName))
+          val groupPromptMessage = testClassList match {
+            case Seq(single) => single
+            case multiple =>
+              collapseTestClassNames(multiple).mkString(", ") + s", ${multiple.length} suites"
           }
+          
+          ((Task.dest / folderName), prepareTestSelectorFolder(testClassList, Task.dest / folderName), groupPromptMessage, testClassList.length)
         }
-
-        val outputs = Task.fork.awaitAll(futures)
-
-        val (lefts, rights) = outputs.partitionMap {
-          case (name, Result.Failure(v)) => Left(name + " " + v)
-          case (name, Result.Success((msg, results))) => Right((name + " " + msg, results))
-        }
-
-        if (lefts.nonEmpty) Result.Failure(lefts.mkString("\n"))
-        else Result.Success((rights.map(_._1).mkString("\n"), rights.flatMap(_._2)))
     }
+
+    val jobs = Task.ctx() match {
+      case j: Ctx.Jobs => j.jobs
+      case _ => 1
+    }
+
+    val maxProcessLength = jobs.toString.length
+    val folderLength = subprocessFolderData.length
+    val maxFolderLength = folderLength.toString.length
+
+    val subprocessFutures = for {
+      processIndex <- 0 until jobs
+      folderIndex <- 0 until folderLength
+      (baseFolder, selectorFolder, promptMessage, numTests) = subprocessFolderData(folderIndex)
+      if processIndex < numTests
+    } yield {
+      val paddedProcessIndex = mill.internal.Util.leftPad(processIndex.toString, maxProcessLength, '0')
+      val paddedFolderIndex = mill.internal.Util.leftPad(folderIndex.toString, maxFolderLength, '0')
+      val processFolder = baseFolder / paddedProcessIndex
+      val processName = s"${baseFolder.last}.${paddedProcessIndex}"
+
+      Task.fork.async(processFolder, s"${paddedFolderIndex}-${paddedProcessIndex}", promptMessage) {
+        processName -> runTestRunnerSubprocess(processFolder, selectorFolder)
+      }
+    }
+
+    val outputs = Task.fork.awaitAll(subprocessFutures)
+
+    val (lefts, rights) = outputs
+      .collect {
+        case (name, Some(result)) => (name, result)
+      }.partitionMap {
+        case (name, Result.Failure(v)) => Left(name + " " + v)
+        case (name, Result.Success((msg, results))) => Right((name + " " + msg, results))
+      }
+
+    val subprocessResult = if (lefts.nonEmpty) Result.Failure(lefts.mkString("\n"))
+      else Result.Success((rights.map(_._1).mkString("\n"), rights.flatMap(_._2)))
 
     subprocessResult match {
       case Result.Failure(errMsg) => Result.Failure(errMsg)
